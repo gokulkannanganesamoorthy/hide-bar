@@ -215,27 +215,48 @@ class MenuBarController: NSObject {
         let items = await enumerator.snapshotItems()
         let myBundle = Bundle.main.bundleIdentifier ?? "com.gokul.HideBar"
         
-        // Find split threshold from AX items first (exact coordinate space as items)
-        let myItems = items.filter { $0.id.bundleID == myBundle }
-        var splitThreshold: CGFloat?
+        // Find frames of both the separator ('|') and the chevron ('>')
+        var separatorFrame: CGRect?
+        var chevronFrame: CGRect?
         
-        // The boundary is the leftmost HideBar control (separator '|' or chevron '>')
-        if let boundaryAX = myItems.min(by: { $0.frame.minX < $1.frame.minX }) {
-            splitThreshold = boundaryAX.frame.minX
-            logToFile("📍 Found boundary item in AX tree at X = \(splitThreshold!) (\(boundaryAX.id.rawValue))")
-        }
-        
-        // Fallback to NSWindow coordinates if AX did not find our buttons
-        if splitThreshold == nil {
-            if let window = separatorItem.button?.window {
-                splitThreshold = window.frame.minX
-            } else if let window = expandItem.button?.window {
-                splitThreshold = window.frame.minX
+        for item in items where item.id.bundleID == myBundle {
+            if item.id.rawValue.hasSuffix("::|") || item.id.rawValue.contains("|") {
+                separatorFrame = item.frame
+                logToFile("📍 Found separator '|' at \(item.frame)")
+            } else {
+                chevronFrame = item.frame
+                logToFile("📍 Found chevron '>' at \(item.frame)")
             }
         }
         
-        let threshold = splitThreshold ?? 0
-        logToFile("📍 HideBar split coordinate threshold: X = \(threshold)")
+        // Fallback to window frames if AX did not find them
+        if separatorFrame == nil, let window = separatorItem.button?.window {
+            separatorFrame = CGRect(x: window.frame.minX, y: window.frame.minY, width: window.frame.width, height: window.frame.height)
+        }
+        if chevronFrame == nil, let window = expandItem.button?.window {
+            chevronFrame = CGRect(x: window.frame.minX, y: window.frame.minY, width: window.frame.width, height: window.frame.height)
+        }
+        
+        let sMinX = separatorFrame?.minX
+        let cMinX = chevronFrame?.minX
+        let sMaxX = separatorFrame?.maxX
+        let cMaxX = chevronFrame?.maxX
+        
+        let leftBound: CGFloat
+        let rightBound: CGFloat
+        
+        if let sMin = sMinX, let cMin = cMinX, let sMax = sMaxX, let cMax = cMaxX {
+            leftBound = min(sMin, cMin)
+            rightBound = max(sMax, cMax)
+        } else {
+            leftBound = sMinX ?? cMinX ?? 0
+            rightBound = sMaxX ?? cMaxX ?? 0
+        }
+        
+        // If the separator and chevron are placed apart, items INSIDE between them are hidden.
+        // If they are adjacent (distance <= 50px), items to the LEFT of the boundary are hidden.
+        let areSeparated = (rightBound - leftBound) > 50
+        logToFile("📍 LeftBound: \(leftBound), RightBound: \(rightBound), areSeparated: \(areSeparated)")
         
         var bundlesToHide = Set<String>()
         var bundlesToKeep = Set<String>()
@@ -247,13 +268,21 @@ class MenuBarController: NSObject {
         for item in items {
             guard let bundleID = item.id.bundleID, bundleID != myBundle else { continue }
             
+            let isTarget: Bool
+            if areSeparated {
+                // Hidden section is inside between '|' and '>'
+                isTarget = (item.frame.midX >= leftBound && item.frame.midX <= rightBound)
+            } else {
+                // Hidden section is to the left of the boundary
+                isTarget = item.frame.midX < leftBound
+            }
+            
             // Check if it's a core system item (Battery, Wi-Fi, Control Center, etc.)
             if let sysItem = MenuBarPolicy.systemItem(for: item.id) {
-                if item.frame.midX < threshold {
+                if isTarget {
                     allowedSystemItems.remove(sysItem)
                     logToFile("🙈 Marking System Item for hide: \(sysItem) at x=\(item.frame.minX)...\(item.frame.maxX)")
                     
-                    // The keyboard viewer needs its underlying bundle explicitly hidden
                     if sysItem == .keyboard {
                         bundlesToHide.insert("com.apple.TextInputMenuAgent")
                         logToFile("🙈 Marking TextInputMenuAgent for hide")
@@ -270,8 +299,7 @@ class MenuBarController: NSObject {
                 continue
             }
             
-            // If the item is located to the LEFT of our separator/chevron, it gets hidden!
-            if item.frame.midX < threshold {
+            if isTarget {
                 bundlesToHide.insert(bundleID)
                 logToFile("🙈 Marking for hide: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
             } else {
@@ -280,7 +308,7 @@ class MenuBarController: NSObject {
             }
         }
         
-        // Any bundle with an item to the RIGHT of the separator must NEVER be hidden
+        // Any bundle with an item OUTSIDE the hidden section must NEVER be hidden
         bundlesToHide.subtract(bundlesToKeep)
         
         // Build the complete allowlist using both running apps and scanned items

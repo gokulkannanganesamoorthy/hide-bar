@@ -94,8 +94,8 @@ class ShelfWindowController: NSWindowController {
     }
     
     func showUnderStatusItem(button: NSStatusBarButton?) {
-        guard let button = button, let screen = button.window?.screen ?? NSScreen.main else { return }
-        let buttonFrame = button.window?.convertToScreen(button.frame) ?? NSRect.zero
+        guard let button = button, let window = button.window, let screen = window.screen else { return }
+        let buttonFrame = window.frame
         
         let x = buttonFrame.midX - (panel.frame.width / 2)
         let y = screen.visibleFrame.maxY - panel.frame.height - 4

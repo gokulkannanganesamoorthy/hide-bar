@@ -16,6 +16,10 @@ class MenuBarController: NSObject {
     private var cancellables = Set<AnyCancellable>()
     private var settingsWindow: NSWindow?
     private var globalMonitor: Any?
+    
+    // Asynchronous item enumerator that reads MenuBarAgent via Accessibility
+    private let enumerator = ItemEnumerator()
+    
     // Floating cover windows for bruteforce hiding
     private var coverWindows: [NSWindow] = []
     
@@ -201,27 +205,46 @@ class MenuBarController: NSObject {
         
         // Find the absolute right edge of the separator on the screen
         let maxX = buttonWindow.convertToScreen(separatorItem.button?.frame ?? .zero).maxX
-        let menuBarHeight = NSStatusBar.system.thickness
-        let frame = NSRect(x: screen.frame.minX, y: screen.visibleFrame.maxY, width: maxX - screen.frame.minX, height: menuBarHeight)
         
-        let win = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        win.level = .statusBar + 1
-        win.backgroundColor = .clear
-        win.isOpaque = false
-        win.hasShadow = false
-        win.ignoresMouseEvents = false // Block clicks to hidden items
-        win.collectionBehavior = [.transient, .ignoresCycle] // Hide in fullscreen
-        
-        let blur = NSVisualEffectView(frame: win.contentView!.bounds)
-        blur.autoresizingMask = [.width, .height]
-        blur.material = .headerView // Best match for menu bar
-        blur.state = .active
-        blur.blendingMode = .behindWindow
-        win.contentView = blur
-        
-        win.setFrame(frame, display: true)
-        win.orderFront(nil)
-        coverWindows.append(win)
+        Task { @MainActor in
+            let items = await enumerator.snapshotItems()
+            var minX = maxX
+            
+            for item in items {
+                // Ignore our own items and the Apple/App menus by assuming status items are mostly contiguous from the right
+                if item.frame.maxX <= maxX {
+                    if item.frame.minX < minX && item.frame.minX > (screen.frame.width * 0.25) {
+                        minX = item.frame.minX
+                    }
+                }
+            }
+            
+            // Add a small padding
+            minX -= 10
+            if minX >= maxX { return } // Nothing to cover
+            
+            let menuBarHeight = NSStatusBar.system.thickness
+            let frame = NSRect(x: minX, y: screen.visibleFrame.maxY, width: maxX - minX, height: menuBarHeight)
+            
+            let win = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            win.level = .statusBar + 1
+            win.backgroundColor = .clear
+            win.isOpaque = false
+            win.hasShadow = false
+            win.ignoresMouseEvents = false // Block clicks to hidden items
+            win.collectionBehavior = [.transient, .ignoresCycle] // Hide in fullscreen
+            
+            let blur = NSVisualEffectView(frame: win.contentView!.bounds)
+            blur.autoresizingMask = [.width, .height]
+            blur.material = .headerView // Best match for menu bar
+            blur.state = .active
+            blur.blendingMode = .behindWindow
+            win.contentView = blur
+            
+            win.setFrame(frame, display: true)
+            win.orderFront(nil)
+            self.coverWindows.append(win)
+        }
     }
     
     private func hideCoverWindows() {

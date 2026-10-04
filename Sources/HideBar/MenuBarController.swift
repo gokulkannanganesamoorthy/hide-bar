@@ -140,7 +140,13 @@ class MenuBarController: NSObject {
     
     private func updateButtonAppearance(button: NSStatusBarButton) {
         let symbolName = isHidden ? prefs.iconStyle.collapsedIcon : prefs.iconStyle.expandedIcon
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "HideBar Toggle")
+        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "HideBar Toggle") {
+            button.image = image
+            button.title = ""
+        } else {
+            button.title = isHidden ? "<" : ">"
+            button.image = nil
+        }
     }
     
     @objc private func handleSeparatorClick() {

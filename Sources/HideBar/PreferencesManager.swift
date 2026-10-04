@@ -7,24 +7,27 @@ enum IconStyle: String, CaseIterable, Identifiable {
     case dots = "Dots ( ••• )"
     case line = "Line ( | )"
     case arrows = "Double Arrow ( » / « )"
+    case custom = "Custom (Emoji / Text)"
     
     var id: String { rawValue }
     
-    var collapsedIcon: String {
+    var collapsedIcon: String? {
         switch self {
         case .chevron: return "chevron.left"
         case .dots: return "circle.fill"
         case .line: return "minus"
         case .arrows: return "chevron.left.2"
+        case .custom: return nil
         }
     }
     
-    var expandedIcon: String {
+    var expandedIcon: String? {
         switch self {
         case .chevron: return "chevron.right"
         case .dots: return "circle"
         case .line: return "pipe"
         case .arrows: return "chevron.right.2"
+        case .custom: return nil
         }
     }
 }
@@ -63,6 +66,14 @@ class PreferencesManager: ObservableObject {
         }
     }
     
+    @Published var customTextCollapsed: String {
+        didSet { UserDefaults.standard.set(customTextCollapsed, forKey: "customTextCollapsed") }
+    }
+    
+    @Published var customTextExpanded: String {
+        didSet { UserDefaults.standard.set(customTextExpanded, forKey: "customTextExpanded") }
+    }
+    
     private init() {
         let storedWidth = UserDefaults.standard.double(forKey: "spacerWidth")
         self.spacerWidth = storedWidth > 0 ? CGFloat(storedWidth) : 600.0
@@ -84,5 +95,8 @@ class PreferencesManager: ObservableObject {
         } else {
             self.showSeparator = UserDefaults.standard.bool(forKey: "showSeparator")
         }
+        
+        self.customTextCollapsed = UserDefaults.standard.string(forKey: "customTextCollapsed") ?? "🙈"
+        self.customTextExpanded = UserDefaults.standard.string(forKey: "customTextExpanded") ?? "🐵"
     }
 }

@@ -142,12 +142,12 @@ class MenuBarController: NSObject {
     }
     
     private func updateButtonAppearance(button: NSStatusBarButton) {
-        let symbolName = isHidden ? prefs.iconStyle.collapsedIcon : prefs.iconStyle.expandedIcon
-        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "HideBar Toggle") {
-            button.image = image
+        if let symbolName = isHidden ? prefs.iconStyle.collapsedIcon : prefs.iconStyle.expandedIcon {
+            let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+            button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "HideBar Toggle")?.withSymbolConfiguration(config)
             button.title = ""
         } else {
-            button.title = isHidden ? "<" : ">"
+            button.title = isHidden ? prefs.customTextCollapsed : prefs.customTextExpanded
             button.image = nil
         }
     }
@@ -234,8 +234,17 @@ class MenuBarController: NSObject {
             
             let btn = NSButton(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
             btn.isBordered = false
-            btn.title = ""
-            btn.image = NSImage(systemSymbolName: prefs.iconStyle.collapsedIcon, accessibilityDescription: "Unhide")
+            
+            if let symbolName = prefs.iconStyle.collapsedIcon {
+                let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+                btn.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Unhide")?.withSymbolConfiguration(config)
+                btn.title = ""
+            } else {
+                btn.image = nil
+                btn.title = prefs.customTextCollapsed
+                btn.font = .systemFont(ofSize: 14, weight: .regular)
+            }
+            
             btn.target = self
             btn.action = #selector(overlayChevronClicked)
             win.contentView = btn
@@ -347,10 +356,9 @@ class MenuBarController: NSObject {
         }
         
         // Build the complete allowlist of all running apps minus the ones we explicitly hide
-        let runningApps = NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
-        for appBundle in runningApps {
-            if !bundlesToHide.contains(appBundle) {
-                bundlesToKeep.insert(appBundle)
+        for item in items {
+            if let bundleID = item.id.bundleID, !bundlesToHide.contains(bundleID) {
+                bundlesToKeep.insert(bundleID)
             }
         }
         

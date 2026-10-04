@@ -114,6 +114,16 @@ struct AppearanceTab: View {
                 }
                 .font(.system(size: 13))
                 
+                if prefs.iconStyle == .custom {
+                    HStack {
+                        TextField("Expanded Text (e.g. 🐵):", text: $prefs.customTextExpanded)
+                            .frame(maxWidth: 200)
+                        TextField("Collapsed Text (e.g. 🙈):", text: $prefs.customTextCollapsed)
+                            .frame(maxWidth: 200)
+                    }
+                    .font(.system(size: 13))
+                }
+                
                 Toggle("Show Separator Line ( | )", isOn: $prefs.showSeparator)
                     .font(.system(size: 13))
             } header: {
@@ -181,6 +191,11 @@ struct HelpTab: View {
             Section {
                 Button("Report a Bug / Crash") {
                     showingBugReport = true
+                }
+                
+                Button("Contact Developer") {
+                    let url = URL(string: "https://github.com/gokulkannanganesamoorthy/hide-bar")!
+                    NSWorkspace.shared.open(url)
                 }
             } header: {
                 Text("Support")

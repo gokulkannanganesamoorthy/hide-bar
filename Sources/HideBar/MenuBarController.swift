@@ -175,10 +175,10 @@ class MenuBarController: NSObject {
         autoCollapseTimer = nil
         
         if isHidden {
-            // Capture chevron frame BEFORE hiding
+            // Capture chevron frame BEFORE hiding using exact window frame
             var chevronFrame: NSRect?
             if let window = expandItem.button?.window {
-                chevronFrame = window.convertToScreen(expandItem.button?.frame ?? .zero)
+                chevronFrame = window.frame
             }
             
             Task {
@@ -220,15 +220,17 @@ class MenuBarController: NSObject {
     
     private func showOverlayChevron(at frame: NSRect) {
         if overlayWindow == nil {
-            let win = NSWindow(contentRect: NSRect(x: frame.minX, y: frame.minY, width: frame.width, height: frame.height),
+            let win = NSWindow(contentRect: frame,
                                styleMask: [.borderless],
                                backing: .buffered,
                                defer: false)
-            win.level = .statusBar + 1
+            win.level = .statusBar
             win.backgroundColor = .clear
             win.isOpaque = false
             win.hasShadow = false
             win.ignoresMouseEvents = false
+            // Don't float over fullscreen apps or spaces
+            win.collectionBehavior = [.transient, .ignoresCycle]
             
             let btn = NSButton(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
             btn.isBordered = false

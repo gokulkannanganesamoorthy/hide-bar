@@ -1,0 +1,16 @@
+# Swift Package Manager & Build artifacts
+.build/
+.swiftpm/
+Packages/*/.build/
+Packages/*/.swiftpm/
+
+# Compiled Application Bundle & Binaries
+HideBar.app/Contents/MacOS/HideBar
+*.dSYM/
+*.o
+*.dia
+
+# macOS system files
+.DS_Store
+*.swp
+*~

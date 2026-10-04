@@ -1,0 +1,699 @@
+// AgentBarEngine.swift
+// The macOS 27 engine: converges the real menubar toward the desired
+// SectionModel using assessment-mode assertions (hide), positions-plist writes
+// (order), and AX (observe/click). One actor — every mutation is serialized,
+// recovery is just another scheduled converge.
+
+import AppKit
+import Foundation
+import PelmetCore
+
+/// Phase timings of one converge, for the app's per-transition perf line.
+/// Diagnostics only — nothing reads it to decide anything.
+public struct ConvergeTiming: Sendable {
+    public enum Outcome: String, Sendable {
+        case swapped, noop, dropped, emptyWalk, unavailable, activationNil, superseded
+    }
+    /// The pre-swap AX walk (`refreshSnapshot`), ms — or the mirror reuse.
+    public var walkMS = 0
+    public var walkReused = false
+    /// `ConvergePlan.compute` plus the running-apps fetch, ms.
+    public var planMS = 0
+    /// From the activate call to the completion (or the deadline), ms.
+    public var activateMS = 0
+    public var activated = false
+    /// `previous.invalidate()` (the old assertion's XPC), ms.
+    public var invalidateMS = 0
+    public var outcome: Outcome = .superseded
+
+    private var walkLabel: String { walkReused ? "mirror \(walkMS)ms" : "walk \(walkMS)ms" }
+
+    public var summary: String {
+        switch outcome {
+        case .swapped:
+            return "\(walkLabel) plan \(planMS)ms activate \(activateMS)ms\(activated ? "" : " (unconfirmed)") invalidate \(invalidateMS)ms"
+        case .noop, .dropped:
+            return "\(walkLabel) plan \(planMS)ms \(outcome.rawValue)"
+        default:
+            return "\(walkLabel) \(outcome.rawValue)"
+        }
+    }
+}
+
+public actor AgentBarEngine: MenuBarEngine {
+    public nonisolated let capabilities = EngineCapabilities(
+        canHide: AssessmentMode.isAvailable,
+        hideGranularity: .bundleID,
+        canReorder: true
+    )
+
+    public nonisolated var events: AsyncStream<EngineEvent> { eventStream }
+    private nonisolated let eventStream: AsyncStream<EngineEvent>
+    private nonisolated let eventContinuation: AsyncStream<EngineEvent>.Continuation
+
+    private let enumerator = ItemEnumerator()
+
+    /// Called on the main actor at the exact moment an assertion swap is
+    /// issued (and on assertion drop), passing the revealed sections. App-side
+    /// items that hide by their own width use this to change size in the SAME
+    /// agent reflow — separate passes animate separately and read as sliding.
+    public var reflowCompanion: (@MainActor @Sendable (Set<Section>) -> Void)?
+
+    public func setReflowCompanion(_ companion: @MainActor @Sendable @escaping (Set<Section>) -> Void) {
+        reflowCompanion = companion
+    }
+
+    private func notifyReflowCompanion() {
+        guard let reflowCompanion else { return }
+        let revealed = revealedSections
+        Task { @MainActor in reflowCompanion(revealed) }
+    }
+
+    private var model = SectionModel()
+    private var revealedSections: Set<Section> = []
+    /// Steady-assertion mode: hold an assertion even when nothing is
+    /// concealable (allowlist = every observed bundle). Keeps macOS's
+    /// collateral-hidden extras (Now Playing, camera pill, AirDrop, Focus)
+    /// consistently gone, so the bar never reflows around them.
+    private var steadyExtras = SettingsDefaults.hideSystemExtras
+    private var assertion: AssessmentAssertion?
+    /// The allowlist/concealable pair the active assertion was built with.
+    /// Converging to an equivalent state is a NO-OP — without this,
+    /// converge→reflow→itemsChanged→converge oscillates forever.
+    private var activeAllowlist: Set<String>?
+    private var activeConcealable: Set<String>?
+    private var activeSystemAllow: Set<Int>?
+
+    /// MenuBarPolicy.identityExemptBundles bound to the running app's bundle
+    /// id, computed once.
+    public static let identityExemptBundles: Set<String> =
+        MenuBarPolicy.identityExemptBundles(
+            pelmetBundleID: PelmetBundle.mainID
+        )
+
+    private var lastSnapshot: EngineSnapshot?
+    private var started = false
+    /// Actor reentrancy guard: converge() suspends several times, and a stale
+    /// converge resuming after a newer one must not activate an outdated
+    /// assertion or stamp an outdated concealed set. Each converge takes a
+    /// ticket; any resume point where the ticket is no longer current aborts.
+    private var convergeEpoch = 0
+    /// When the last assertion swap was issued — teardown detection ignores
+    /// the settle window right after a swap (items take a beat to drop out).
+    private var lastSwapAt = Date.distantPast
+    /// Bounded retries for converges that find an EMPTY AX walk. A real bar
+    /// always contains system items, so empty means the agent tree isn't
+    /// readable yet (launch, locked screen) — planning from it swaps in an
+    /// allow-all assertion that un-hides everything for a beat.
+    private var emptyAXRetriesRemaining = EngineTiming.emptyAXRetries
+
+    /// Timings of the most recent converge that ran to a decision (PerfTrace
+    /// reads it right after `reveal`/`conceal` return).
+    public private(set) var lastConvergeTiming: ConvergeTiming?
+    private var timing = ConvergeTiming()
+
+    private static func ms(since start: Date) -> Int {
+        Int((-start.timeIntervalSinceNow * 1000).rounded())
+    }
+
+    public init() {
+        var continuation: AsyncStream<EngineEvent>.Continuation!
+        self.eventStream = AsyncStream { continuation = $0 }
+        self.eventContinuation = continuation
+    }
+
+    // MARK: - Lifecycle
+
+    public func start() async {
+        guard !started else { return }
+        started = true
+        _ = await refreshSnapshot()
+    }
+
+    /// TERMINAL: finishing the event stream is irreversible, so the engine is
+    /// single-use — one instance per app lifetime. `started` deliberately
+    /// stays true so a later `start()` is a no-op instead of running with a
+    /// dead stream.
+    public func stop() async {
+        invalidateAssertion()
+        // Ends any `for await` over `events` instead of hanging it forever.
+        eventContinuation.finish()
+    }
+
+    // MARK: - MenuBarEngine
+
+    public func snapshot() async -> EngineSnapshot {
+        if let lastSnapshot, Date().timeIntervalSince(lastSnapshot.takenAt) < EngineTiming.snapshotTTL {
+            return lastSnapshot
+        }
+        return await refreshSnapshot()
+    }
+
+    public func setModel(_ model: SectionModel) async {
+        self.model = model
+        await converge()
+    }
+
+    public func setSteadyExtras(_ enabled: Bool) async {
+        guard steadyExtras != enabled else { return }
+        steadyExtras = enabled
+        await converge()
+    }
+
+    public func reveal(_ sections: Set<Section>) async {
+        revealedSections.formUnion(sections)
+        await converge()
+    }
+
+    public func conceal() async {
+        revealedSections = []
+        await converge()
+    }
+
+    /// Bundle ids of the running applications, pushed by the app from its
+    /// KVO on `NSWorkspace.runningApplications`.
+    private var runningBundles: Set<String>?
+
+    public func setRunningBundles(_ bundles: Set<String>) {
+        runningBundles = bundles
+    }
+
+    public func quiesced(for interval: TimeInterval) -> Bool {
+        Date().timeIntervalSince(lastSwapAt) > interval
+    }
+
+    /// The mirror when it was walked at rest — `restWalkDelay` past the
+    /// last swap, so the agent's reflow was over — and is recent enough
+    /// (`restSnapshotReuse`). Nil means the bar may have changed since:
+    /// walk. Only Pelmet's own swaps move the bar's contents on their own;
+    /// app launches and user drags reach the mirror through the walks the
+    /// app already runs for them.
+    public var restSnapshot: EngineSnapshot? {
+        guard let last = lastSnapshot, !last.items.isEmpty,
+              last.takenAt.timeIntervalSince(lastSwapAt) >= EngineTiming.restWalkDelay,
+              Date().timeIntervalSince(last.takenAt) < EngineTiming.restSnapshotReuse
+        else { return nil }
+        return last
+    }
+
+    /// Fresh registrations under ANY active assertion park offscreen and
+    /// never enter the agent's AX tree (verified at boot — it's why start()
+    /// waits for own-item adoption; re-verified live 2026-08-31: a relaunched
+    /// Bitwarden stayed parked 4+ minutes). The swap choreography is
+    /// deliberately gapless, so no adoption window ever occurs on its own.
+    /// This opens one: drop the assertion, poll the walk until the bundle's
+    /// item lands (parked items land instantly once no assertion holds),
+    /// then re-converge. Cost: concealed items flash for the window's
+    /// duration — callers keep it rare (app relaunch) and skip it when the
+    /// bundle is already observable.
+    ///
+    /// `item`: the one live id the window is for. A section helper hosts
+    /// several items under one bundle, so "any item of this bundle" is
+    /// satisfied by a sibling that was adopted long ago and the window
+    /// closes before the new registration lands (parked for the session).
+    /// Whether a hide assertion is held right now. Callers use it to decide
+    /// if an adoption window will actually drop anything worth covering —
+    /// with none held `openAdoptionWindow` returns straight away and the
+    /// bar never changes.
+    public var holdsAssertion: Bool { assertion != nil }
+
+    public func openAdoptionWindow(for bundleID: String, expecting item: ItemID? = nil) async -> Bool {
+        guard assertion != nil else { return true }
+        PelmetLog.log("adoptWindow: dropping assertion for \(item?.rawValue ?? bundleID)")
+        invalidateAssertion()
+        var adopted = false
+        let deadline = Date().addingTimeInterval(EngineTiming.adoptionWindowDeadline)
+        while Date() < deadline {
+            let snap = await refreshSnapshot()
+            let landed = item.map { id in snap.items.contains { $0.id == id } }
+                ?? snap.items.contains { $0.id.bundleID == bundleID }
+            if landed {
+                adopted = true
+                break
+            }
+            try? await Task.sleep(for: EngineTiming.adoptionWindowPoll)
+        }
+        PelmetLog.log("adoptWindow: \(bundleID) \(adopted ? "adopted" : "not seen") — re-asserting")
+        await converge()
+        return adopted
+    }
+
+    /// Desired left-to-right tag order: model order per section, sections
+    /// laid out as [alwaysHidden][hidden][visible] (hidden sections collapse
+    /// toward the left of the status area, matching the classic layout).
+    /// Concealed items drop out of AX but are exactly the ones being ordered
+    /// — union them in (frame nil sorts by explicit order only).
+    private func desiredOrderedTags(from snapshot: EngineSnapshot) -> [String] {
+        let liveIDs = Set(snapshot.items.map(\.id))
+        let concealedItems = snapshot.concealed.subtracting(liveIDs).map {
+            ObservedItem(id: $0, frame: nil, appName: nil)
+        }
+        let allItems = snapshot.items + concealedItems
+        var orderedTags: [String] = []
+        for section in [Section.alwaysHidden, .hidden, .visible] {
+            let sectionItems = allItems
+                .filter { model.section(of: $0.id) == section && !$0.id.isSystemModule }
+            let explicit = model.order[section] ?? []
+            let ranked = sectionItems.sorted { lhs, rhs in
+                // Order arrays hold canonical section keys — rank real items
+                // through the same lens.
+                let li = explicit.firstIndex(of: lhs.id.sectionKey) ?? Int.max
+                let ri = explicit.firstIndex(of: rhs.id.sectionKey) ?? Int.max
+                if li != ri { return li < ri }
+                // Fall back to current on-screen order (agent order);
+                // frame-nil (concealed) items rank rightmost — the editor's
+                // rule, pinned by EditorItemsBuilderTests.
+                return (lhs.frame?.minX ?? .greatestFiniteMagnitude)
+                    < (rhs.frame?.minX ?? .greatestFiniteMagnitude)
+            }
+            orderedTags.append(contentsOf: ranked.map(\.id.rawValue))
+        }
+        return orderedTags
+    }
+
+    /// Write the model's desired order to the agent plist WITHOUT restarting
+    /// the agent. Live items ignore the plist entirely — their order lives in
+    /// the client processes' own registrations (proven live 2026-08-21:
+    /// plist writes + restarts + conceal/reveal cycles never re-slot a live
+    /// item, while a real ⌘-drag survives agent restarts with no disk record)
+    /// — but a FRESH registration (app relaunch, brand-new item) slots from
+    /// it, so the hint keeps future spawns landing in model order.
+    public func writeOrderHint() async {
+        let snapshot = await refreshSnapshot()
+        AgentPositionStore.writeOrder(desiredOrderedTags(from: snapshot))
+    }
+
+    // MARK: - Convergence
+
+    /// The one path that changes hide state. Idempotent: computes the full
+    /// allowlist from (model, revealedSections) and swaps the assertion in a
+    /// single transition.
+    private func converge() async {
+        convergeEpoch += 1
+        let epoch = convergeEpoch
+        timing = ConvergeTiming()
+        // Stamped whatever the outcome — a superseded converge reads
+        // `superseded` rather than leaving the previous one's numbers
+        // under the next perf line.
+        defer { lastConvergeTiming = timing }
+        var phase = Date()
+        let snapshot: EngineSnapshot
+        if let rest = restSnapshot {
+            // The bar has not reflowed since this walk: plan from it. A
+            // bundle that appeared since is caught by the walk behind the
+            // swap, one converge later — the same window the app already
+            // has between walks at rest.
+            snapshot = rest
+            timing.walkReused = true
+        } else {
+            snapshot = await refreshSnapshot()
+        }
+        timing.walkMS = Self.ms(since: phase)
+        guard epoch == convergeEpoch else { return }
+        if snapshot.items.isEmpty {
+            timing.outcome = .emptyWalk
+            deferEmptyWalkRetry()
+            return
+        }
+        emptyAXRetriesRemaining = EngineTiming.emptyAXRetries
+        // Running-app set: consulted by the stale prune below (quit apps) and
+        // the allowlist build. Fetched once, up front.
+        phase = Date()
+        // The app keeps this set from its KVO on runningApplications; the
+        // main-actor hop it replaced waited on a busy main thread (plan
+        // read 1–19ms, 2026-09-21). Fetched once when nothing was pushed.
+        let runningBundles: Set<String>
+        if let known = self.runningBundles {
+            runningBundles = known
+        } else {
+            runningBundles = await MainActor.run {
+                Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+            }
+            self.runningBundles = runningBundles
+        }
+        guard epoch == convergeEpoch else { return }
+        // The pure decision step — "existing" set (observed ∪ carried
+        // concealed, drift-pruned), concealable bundles, system allowlist,
+        // bundle allowlist, resulting concealed set. Logic + rationale live
+        // in ConvergePlan.compute (unit-tested); this actor only executes.
+        let plan = ConvergePlan.compute(
+            model: model,
+            liveIDs: Set(snapshot.items.map(\.id)),
+            carriedConcealed: lastSnapshot?.concealed ?? [],
+            runningBundles: runningBundles,
+            revealedSections: revealedSections,
+            steadyExtras: steadyExtras,
+            exemptBundles: Self.identityExemptBundles
+        )
+        timing.planMS = Self.ms(since: phase)
+        for (id, reason) in plan.stale {
+            PelmetLog.log("converge: pruned concealed \(reason == .staleAlias ? "stale alias" : "entry for quit app") \(id.rawValue)")
+        }
+
+        guard AssessmentMode.isAvailable else {
+            timing.outcome = .unavailable
+            if assertion != nil { invalidateAssertion() }
+            eventContinuation.yield(.availabilityChanged(false))
+            return
+        }
+
+        if plan.dropAssertion {
+            timing.outcome = .dropped
+            await dropAssertionPath(epoch: epoch)
+            return
+        }
+        // With steadyExtras on, an empty concealable set still holds an
+        // assertion allowing every observed bundle — only the OS extras hide.
+        await performSwap(plan: plan, snapshot: snapshot, epoch: epoch)
+    }
+
+    /// An empty AX walk can't be trusted: a real bar always has system
+    /// items, so this is the agent tree not being readable yet (launch,
+    /// locked screen). A plan computed from it has concealable=[] and
+    /// would swap in an allow-all assertion — a momentary un-hide flash
+    /// followed by a second animated swap when AX populates. Defer with a
+    /// bounded retry; past the bound, the itemsChanged fired by the first
+    /// successful re-walk re-converges us.
+    private func deferEmptyWalkRetry() {
+        PelmetLog.log("converge: AX walk empty — deferring (retries left \(emptyAXRetriesRemaining))")
+        if emptyAXRetriesRemaining > 0 {
+            emptyAXRetriesRemaining -= 1
+            Task {
+                try? await Task.sleep(for: EngineTiming.emptyAXRetryDelay)
+                await self.converge()
+            }
+        }
+    }
+
+    /// Nothing to hide and extras are allowed back: drop the assertion.
+    private func dropAssertionPath(epoch: Int) async {
+        invalidateAssertion()
+        notifyReflowCompanion()
+        let after = await refreshSnapshot()
+        guard epoch == convergeEpoch else { return }
+        // Nothing is concealed now — clearing the carried set here stops
+        // observers from reporting phantom concealment until the next swap.
+        lastSnapshot = EngineSnapshot(
+            items: after.items,
+            concealed: [],
+            takenAt: after.takenAt
+        )
+    }
+
+    /// The swap half of converge: teardown detection, the idempotence no-op
+    /// guard, assertion activation (activate new THEN invalidate previous),
+    /// snapshot stamping, and the off-critical-path verify kickoff.
+    private func performSwap(plan: ConvergePlan, snapshot: EngineSnapshot, epoch: Int) async {
+        let concealable = plan.concealable
+        let allowedSystem = plan.allowedSystem
+        let allowedBundles = plan.allowedBundles
+
+        // Teardown detection: a concealable bundle observed LIVE while our
+        // bookkeeping claims a matching assertion means macOS dropped the
+        // assertion externally — without this, the itemsChanged the
+        // reappearance triggers converges straight into the no-op guard and
+        // the wedge is permanent. Only trust the signal once the post-swap
+        // settle window (verify covers 3s) has passed, or the normal AX
+        // drop-out latency right after a swap would read as a violation.
+        // Gated on a live assertion: with none held, `lastSwapAt` is still
+        // .distantPast on a cold boot and the pre-assert bar (everything
+        // visible) read as a teardown — a spurious .assertionTornDown +
+        // wasted converge on every launch.
+        let assertionLost = assertion != nil
+            && Date().timeIntervalSince(lastSwapAt) > EngineTiming.teardownSettleWindow
+            && snapshot.items.contains { item in
+                guard let bundle = item.id.bundleID else { return false }
+                return concealable.contains(bundle)
+            }
+
+        // Idempotence: an equivalent state under a live assertion = already
+        // converged. Skip the swap — this is what breaks event feedback loops.
+        // Superset check (not equality): an app quitting leaves a harmless
+        // stale allow entry and must not cause a swap; a NEW bundle missing
+        // from the active allowlist must.
+        if assertion != nil, !assertionLost,
+           activeConcealable == concealable,
+           activeSystemAllow == Set(allowedSystem.map(\.rawValue)),
+           let activeAllowlist, activeAllowlist.isSuperset(of: allowedBundles) {
+            timing.outcome = .noop
+            PelmetLog.log("converge: no-op (concealable=\(concealable.count), allow=\(allowedBundles.count))")
+            // The assertion stands, but the bookkeeping may not: a carried
+            // id whose section is now revealed is no longer concealed, and
+            // left stamped it drew a ghost tile in the editor (Apple's Siri
+            // and Time Machine switched off under a revealed Hidden section,
+            // 2026-09-16 — SystemUIServer runs forever, so nothing else
+            // ever pruned them).
+            if let last = lastSnapshot, last.concealed != plan.concealed {
+                lastSnapshot = EngineSnapshot(items: snapshot.items, concealed: plan.concealed, takenAt: snapshot.takenAt)
+            }
+            return
+        }
+        if assertionLost {
+            PelmetLog.log("converge: concealable items visible under live bookkeeping — assertion lost, re-swapping")
+            eventContinuation.yield(.assertionTornDown)
+        }
+        PelmetLog.log("converge: swapping — concealable=\(concealable.sorted()), allow=\(allowedBundles.count), revealed=\(revealedSections.count), live=\(snapshot.items.count), carried=\(lastSnapshot?.concealed.count ?? -1), assigns=\(model.assignments.count)")
+
+        let previous = assertion
+        // Bounded wait: the completion is async (and can be a dud) — a stuck
+        // activation must never wedge the converge path. 3s is generous; the
+        // observed completion latency is <100ms.
+        let activationBox = ActivationBox()
+        let activateStarted = Date()
+        let handle = AssessmentMode.activate(allowing: allowedSystem, bundleIDs: Array(allowedBundles)) { error in
+            activationBox.resolve(error == nil)
+        }
+        // Companion items change size NOW so the agent coalesces their reflow
+        // with the assertion swap it's about to animate.
+        notifyReflowCompanion()
+
+        guard let handle else {
+            // No handle at all: keep the previous assertion alive (it still
+            // holds SOME hide state) and leave bookkeeping pointing at it —
+            // the next converge toward this target won't match the no-op
+            // guard, so retrying stays possible. Invalidating `previous` here
+            // used to kill the still-current assertion and wedge the state.
+            timing.outcome = .activationNil
+            PelmetLog.log("converge: activation returned nil handle — keeping previous assertion")
+            eventContinuation.yield(.convergeFailed("assertion activation failed"))
+            return
+        }
+        assertion = handle
+        activeAllowlist = allowedBundles
+        activeConcealable = concealable
+        activeSystemAllow = Set(allowedSystem.map(\.rawValue))
+        lastSwapAt = Date()
+        // Resumed by the completion the moment it lands (measured 2026-09-21:
+        // the old 50ms poll made every swap read 50–55ms) or by the deadline.
+        let activated = await activationBox.wait(deadline: .seconds(EngineTiming.activationDeadline))
+        timing.activateMS = Self.ms(since: activateStarted)
+        timing.activated = activated
+        // Swap order matters: activate the new state, then drop the old
+        // assertion so there is no flash of everything-visible in between.
+        let invalidateStarted = Date()
+        previous?.invalidate()
+        timing.invalidateMS = Self.ms(since: invalidateStarted)
+        guard epoch == convergeEpoch else { return }
+
+        if !activated {
+            PelmetLog.log("converge: assertion activation FAILED (dud completion)")
+            // The handle exists but activation never confirmed — the real hide
+            // state is unknown. Drop the allowlist bookkeeping so the next
+            // converge fails the no-op guard and re-swaps instead of wedging.
+            activeAllowlist = nil
+            eventContinuation.yield(.convergeFailed("assertion activation failed"))
+        } else {
+            PelmetLog.log("converge: assertion active")
+        }
+        // Stamp the concealed set NOW — observers must union it from the
+        // moment the swap is issued — on the pre-swap items: the post-swap
+        // walk blocks on the agent's reflow (measured 2026-09-21: 53–193ms,
+        // longer the sooner it starts) and holding converge for it held the
+        // settle report, the rehide countdown and every queued transition.
+        // The walk runs behind the swap instead and refreshes the mirror
+        // when it lands (it fires itemsChanged as it always did).
+        timing.outcome = .swapped
+        // Stamped with the swap time, not the mirror's: `snapshot()` reads
+        // it inside its TTL right after the swap instead of walking
+        // mid-reflow (a 200ms walk on the settle path, 2026-09-21 11:05),
+        // and `restSnapshot` stays nil until a walk at rest replaces it.
+        lastSnapshot = EngineSnapshot(
+            items: snapshot.items,
+            concealed: plan.concealed,
+            takenAt: Date()
+        )
+        Task { await self.walkAfterSwap(concealable: concealable, epoch: epoch) }
+    }
+
+    /// The post-swap walk, off the critical path. It is the verify's first
+    /// poll: when it already shows every concealable bundle gone there is
+    /// nothing to poll for. A newer converge owns the state (and walks for
+    /// itself) once the epoch has moved.
+    private func walkAfterSwap(concealable: Set<String>, epoch: Int) async {
+        guard epoch == convergeEpoch else { return }
+        let started = Date()
+        let after = await refreshSnapshot()
+        PelmetLog.log("converge: post-swap walk \(Self.ms(since: started))ms (background)")
+        guard epoch == convergeEpoch else { return }
+        let stillVisible = after.items.contains { item in
+            guard let bundle = item.id.bundleID else { return false }
+            return concealable.contains(bundle)
+        }
+        if stillVisible {
+            await verifyConcealment(of: concealable)
+        }
+        // A walk that ran inside the reflow can list half the strip (AX
+        // adds freshly revealed items progressively). One more at rest
+        // makes the mirror whole, so the next transition can plan and
+        // measure from it instead of walking (`restSnapshot`).
+        // Not epoch-gated: the itemsChanged this walk fires runs a no-op
+        // converge (a new epoch) before the bar is at rest, and its walk is
+        // mid-reflow too. A newer SWAP moves `lastSwapAt`, so the wait
+        // below simply extends to that one's rest.
+        var untilRest = EngineTiming.restWalkDelay - Date().timeIntervalSince(lastSwapAt)
+        while untilRest > 0 {
+            try? await Task.sleep(for: .seconds(untilRest))
+            untilRest = EngineTiming.restWalkDelay - Date().timeIntervalSince(lastSwapAt)
+        }
+        guard restSnapshot == nil else { return }
+        let restStarted = Date()
+        _ = await refreshSnapshot()
+        PelmetLog.log("converge: rest walk \(Self.ms(since: restStarted))ms (background)")
+    }
+
+    /// Background verify-after-apply: bounded poll until the concealed
+    /// bundles drop out of the AX tree. Bails silently when a newer converge
+    /// has superseded this one — that converge owns the state now.
+    private func verifyConcealment(of concealable: Set<String>) async {
+        let deadline = Date().addingTimeInterval(EngineTiming.verifyWindow)
+        while Date() < deadline {
+            try? await Task.sleep(for: EngineTiming.verifyPoll)
+            guard activeConcealable == concealable else { return }
+            let check = await refreshSnapshot()
+            let stillVisible = check.items.contains { item in
+                guard let bundle = item.id.bundleID else { return false }
+                return concealable.contains(bundle)
+            }
+            if !stillVisible { return }
+        }
+        guard activeConcealable == concealable else { return }
+        PelmetLog.log("converge: STILL VISIBLE after verify window")
+        // The assertion claims these bundles are hidden but reality disagrees
+        // (dud activation, or macOS tore the assertion down externally). Drop
+        // the allowlist bookkeeping so the next converge re-swaps instead of
+        // no-op'ing against bookkeeping that no longer reflects the bar.
+        activeAllowlist = nil
+        eventContinuation.yield(.convergeFailed("concealed items still visible after verify window"))
+    }
+
+    /// Thread-safe one-shot for the assertion completion (delivered on an
+    /// arbitrary queue by the private framework, possibly late, possibly
+    /// never, possibly twice). The first `resolve` wins; `wait` resumes on
+    /// it at once, or with `false` at the deadline — a dud completion that
+    /// lands after the deadline is ignored, as before.
+    private final class ActivationBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Bool?
+        private var waiter: CheckedContinuation<Bool, Never>?
+
+        func resolve(_ success: Bool) {
+            lock.lock()
+            guard value == nil else { lock.unlock(); return }
+            value = success
+            let waiter = self.waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume(returning: success)
+        }
+
+        func wait(deadline: Duration) async -> Bool {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let value {
+                    lock.unlock()
+                    continuation.resume(returning: value)
+                    return
+                }
+                waiter = continuation
+                lock.unlock()
+                Task {
+                    try? await Task.sleep(for: deadline)
+                    self.resolve(false)
+                }
+            }
+        }
+    }
+
+    // MARK: - Clock blink
+
+    /// Drop the live assertion so a clock click can reach Notification
+    /// Center (ControlCenter refuses it under ANY visibility restriction —
+    /// probe-proven 2026-09-03, no origin or allowlist escapes it). Returns
+    /// false when nothing was held, in which case the click needs no help.
+    /// Synchronous inside the actor: the caller posts the click the moment
+    /// this returns, and the invalidate XPC is already queued ahead of it.
+    /// Bumps the converge epoch so an in-flight converge can't re-assert
+    /// between the drop and the click.
+    public func beginClockBlink() -> Bool {
+        guard assertion != nil else { return false }
+        convergeEpoch += 1
+        invalidateAssertion()
+        PelmetLog.log("clock: blink — assertion dropped for the click")
+        return true
+    }
+
+    /// Re-acquire after the click landed. Bookkeeping was cleared by the
+    /// drop, so a plain converge fails the no-op guard and swaps back in.
+    /// (The reflow's own itemsChanged may have converged already; then this
+    /// is the no-op.) NC stays open through the re-acquire — verified.
+    public func endClockBlink() async {
+        await converge()
+    }
+
+    /// Visibility oracle for the blink cover: a fresh AX walk (the cached
+    /// snapshot is up to 0.5s old) — true while any item of a bundle the
+    /// live assertion conceals is still in the agent's tree. The bundle set,
+    /// not the snapshot's stamped ids: a converge that lost its epoch to a
+    /// hover reveal leaves the stamp stale (2026-09-14).
+    /// A fresh AX walk, bypassing the snapshot cache.
+    public func freshSnapshot() async -> EngineSnapshot {
+        await refreshSnapshot()
+    }
+
+    public func concealedItemsStillVisible() async -> Bool {
+        guard let concealable = activeConcealable, !concealable.isEmpty else { return false }
+        let snap = await refreshSnapshot()
+        return snap.items.contains { $0.id.bundleID.map(concealable.contains) ?? false }
+    }
+
+    private func invalidateAssertion() {
+        if assertion != nil {
+            // Dropping an assertion reflows the bar exactly like a swap —
+            // stamp lastSwapAt so quiesced() goes false and overlay covers
+            // hold through the drop's animation instead of lifting mid-slide.
+            lastSwapAt = Date()
+        }
+        assertion?.invalidate()
+        assertion = nil
+        activeAllowlist = nil
+        activeConcealable = nil
+        activeSystemAllow = nil
+    }
+
+    private func refreshSnapshot() async -> EngineSnapshot {
+        let raw = await enumerator.snapshotItems()
+        let previousIDs = lastSnapshot.map { Set($0.items.map(\.id)) }
+        let snapshot = EngineSnapshot(
+            items: raw.map {
+                ObservedItem(id: $0.id, frame: $0.frame, appName: $0.appName, hostIsBundleless: $0.hostIsBundleless, pid: $0.pid)
+            },
+            concealed: lastSnapshot?.concealed ?? [],
+            takenAt: Date()
+        )
+        if let previousIDs, previousIDs != Set(raw.map(\.id)) {
+            eventContinuation.yield(.itemsChanged)
+        }
+        lastSnapshot = snapshot
+        return snapshot
+    }
+}

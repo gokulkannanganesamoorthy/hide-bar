@@ -1,0 +1,202 @@
+import Foundation
+import Testing
+import PelmetCore
+@testable import PelmetEngine
+
+@Suite struct ConvergePlanTests {
+    @Test func inputSourceSwitchKeepsKeyboardHiddenUntilReveal() {
+        let weType = ItemID.status(bundle: "com.apple.TextInputMenuAgent", title: "微信输入法")
+        let abc = ItemID.status(bundle: "com.apple.TextInputMenuAgent", title: "ABC")
+        for revealed in [Set<PelmetCore.Section>(), Set<PelmetCore.Section>([.hidden])] {
+            let plan = ConvergePlan.compute(
+                model: model([weType.sectionKey: .hidden]),
+                liveIDs: [abc], carriedConcealed: [],
+                runningBundles: ["com.apple.TextInputMenuAgent"],
+                revealedSections: revealed, steadyExtras: true, exemptBundles: exempt
+            )
+            #expect(plan.hiddenSystem.contains(.keyboard) == revealed.isEmpty)
+            #expect(plan.allowedSystem.contains(.keyboard) == !revealed.isEmpty)
+            #expect(plan.concealed.contains(abc) == revealed.isEmpty)
+        }
+    }
+
+    @Test func systemUIServerHidesThroughTheBundleAllowlist() {
+        let siri = ItemID.status(bundle: "com.apple.systemuiserver", title: "Siri")
+        let plan = ConvergePlan.compute(
+            model: model([siri.sectionKey: .hidden]),
+            liveIDs: [siri], carriedConcealed: [],
+            runningBundles: ["com.apple.systemuiserver", "com.example.other"],
+            revealedSections: [], steadyExtras: true, exemptBundles: exempt
+        )
+        #expect(plan.concealable.contains("com.apple.systemuiserver"))
+        #expect(!plan.allowedBundles.contains("com.apple.systemuiserver"))
+        #expect(plan.allowedBundles.contains("com.example.other"))
+        #expect(plan.concealed.contains(siri))
+        #expect(plan.hiddenSystem.isEmpty)
+    }
+
+    let velja = ItemID(rawValue: "status:com.sindresorhus.Velja::Item-0")
+    let veljaDrifted = ItemID(rawValue: "status:com.sindresorhus.Velja::Left and right arrows in a filled circle")
+    let otterkeep = ItemID(rawValue: "status:com.example.otterkeep::Item-0")
+    let sound = ItemID(rawValue: "status:com.apple.MenuBarAgent::com.apple.menuextra.sound")
+    let exempt: Set<String> = ["app.fif7y.Pelmet", "com.apple.MenuBarAgent"]
+
+    func model(_ assignments: [ItemID: PelmetCore.Section]) -> SectionModel {
+        SectionModel(assignments: assignments)
+    }
+
+    @Test func hiddenAssignmentConcealsObservedBundle() {
+        let plan = ConvergePlan.compute(
+            model: model([velja: .alwaysHidden, otterkeep: .hidden]),
+            liveIDs: [velja, otterkeep],
+            carriedConcealed: [],
+            runningBundles: ["com.sindresorhus.Velja", "com.example.otterkeep", "com.apple.finder"],
+            revealedSections: [],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.concealable == ["com.sindresorhus.Velja", "com.example.otterkeep"])
+        #expect(plan.concealed == [velja, otterkeep])
+        #expect(!plan.allowedBundles.contains("com.sindresorhus.Velja"))
+        #expect(plan.allowedBundles.contains("com.apple.finder"))
+        #expect(!plan.dropAssertion)
+    }
+
+    @Test func lostCarriedStateStillConcealsAssignedBundles() {
+        // Regression: the carried concealed set is bookkeeping and can be
+        // lost. A concealed item is neither live nor carried then — but its
+        // assignment plus a running app is enough to keep it off the
+        // allowlist. The observation-only plan swapped in allow-all here.
+        let plan = ConvergePlan.compute(
+            model: model([velja: .alwaysHidden, otterkeep: .hidden]),
+            liveIDs: [sound],
+            carriedConcealed: [],
+            runningBundles: ["com.sindresorhus.Velja", "com.example.otterkeep", "com.apple.finder"],
+            revealedSections: [.hidden],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.concealable == ["com.sindresorhus.Velja"])
+        #expect(!plan.allowedBundles.contains("com.sindresorhus.Velja"))
+        #expect(plan.allowedBundles.contains("com.example.otterkeep"))
+    }
+
+    @Test func revealingSectionReleasesItsBundles() {
+        let plan = ConvergePlan.compute(
+            model: model([velja: .alwaysHidden, otterkeep: .hidden]),
+            liveIDs: [velja, otterkeep],
+            carriedConcealed: [],
+            runningBundles: [],
+            revealedSections: [.hidden],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.concealable == ["com.sindresorhus.Velja"])
+        #expect(plan.concealed == [velja])
+        #expect(plan.allowedBundles.contains("com.example.otterkeep"))
+    }
+
+    @Test func concealedCarriedItemStaysConcealableWhileUnobservable() {
+        // The oscillation case: item concealed → unobservable. The carried
+        // set must keep it in the concealable computation.
+        let plan = ConvergePlan.compute(
+            model: model([velja: .alwaysHidden]),
+            liveIDs: [],
+            carriedConcealed: [velja],
+            runningBundles: ["com.sindresorhus.Velja"],
+            revealedSections: [],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.concealable == ["com.sindresorhus.Velja"])
+        #expect(plan.concealed == [velja])
+    }
+
+    @Test func driftedTagPrunesStaleAliasFromConcealed() {
+        // Velja re-enumerated under a new tag while its old tag rode the
+        // carried set — the plan keeps ONE concealed entry, the live one.
+        let plan = ConvergePlan.compute(
+            model: model([veljaDrifted: .alwaysHidden]),
+            liveIDs: [veljaDrifted],
+            carriedConcealed: [velja],
+            runningBundles: ["com.sindresorhus.Velja"],
+            revealedSections: [],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.stale == [velja: .staleAlias])
+        #expect(plan.concealed == [veljaDrifted])
+    }
+
+    @Test func quitAppLeavesConcealedSet() {
+        let plan = ConvergePlan.compute(
+            model: model([velja: .alwaysHidden]),
+            liveIDs: [],
+            carriedConcealed: [velja],
+            runningBundles: [],
+            revealedSections: [],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.stale == [velja: .quitApp])
+        #expect(plan.concealed.isEmpty)
+    }
+
+    @Test func explicitVisibleSystemAssignmentNeverHides() {
+        let plan = ConvergePlan.compute(
+            model: model([sound: .visible]),
+            liveIDs: [sound],
+            carriedConcealed: [],
+            runningBundles: [],
+            revealedSections: [],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.hiddenSystem.isEmpty)
+        #expect(plan.allowedSystem.contains(.volume))
+    }
+
+    @Test func hiddenSystemAssignmentLeavesAllowlist() {
+        let plan = ConvergePlan.compute(
+            model: model([sound: .hidden]),
+            liveIDs: [sound],
+            carriedConcealed: [],
+            runningBundles: [],
+            revealedSections: [],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(plan.hiddenSystem == [.volume])
+        #expect(!plan.allowedSystem.contains(.volume))
+        #expect(plan.concealed == [sound])
+    }
+
+    @Test func nothingToHideWithoutSteadyExtrasDropsAssertion() {
+        let plan = ConvergePlan.compute(
+            model: model([:]),
+            liveIDs: [velja],
+            carriedConcealed: [],
+            runningBundles: ["com.sindresorhus.Velja"],
+            revealedSections: [],
+            steadyExtras: false,
+            exemptBundles: exempt
+        )
+        #expect(plan.dropAssertion)
+        #expect(plan.concealed.isEmpty)
+        #expect(plan.allowedBundles.isEmpty)
+    }
+
+    @Test func steadyExtrasHoldsAssertionWithNothingConcealable() {
+        let plan = ConvergePlan.compute(
+            model: model([:]),
+            liveIDs: [velja],
+            carriedConcealed: [],
+            runningBundles: ["com.sindresorhus.Velja"],
+            revealedSections: [],
+            steadyExtras: true,
+            exemptBundles: exempt
+        )
+        #expect(!plan.dropAssertion)
+        #expect(plan.allowedBundles.contains("com.sindresorhus.Velja"))
+    }
+}

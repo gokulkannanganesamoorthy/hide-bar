@@ -23,6 +23,9 @@ class MenuBarController: NSObject {
     // Asynchronous item enumerator that reads MenuBarAgent via Accessibility
     private let enumerator = ItemEnumerator()
     
+    // Floating overlay for when Assessment Mode hides our NSStatusItem
+    private var overlayWindow: NSWindow?
+    
     private let prefs = PreferencesManager.shared
     
     override init() {
@@ -172,11 +175,22 @@ class MenuBarController: NSObject {
         autoCollapseTimer = nil
         
         if isHidden {
+            // Capture chevron frame BEFORE hiding
+            var chevronFrame: NSRect?
+            if let window = expandItem.button?.window {
+                chevronFrame = window.convertToScreen(expandItem.button?.frame ?? .zero)
+            }
+            
             Task {
                 await applyHideBasedOnCoordinates()
+                if let frame = chevronFrame {
+                    self.showOverlayChevron(at: frame)
+                }
             }
             ShelfWindowController.shared.hide()
         } else {
+            hideOverlayChevron()
+            
             // Restore all items
             if let assertion = activeAssertion {
                 assertion.invalidate()
@@ -202,6 +216,41 @@ class MenuBarController: NSObject {
         if let btn = expandItem.button {
             updateButtonAppearance(button: btn)
         }
+    }
+    
+    private func showOverlayChevron(at frame: NSRect) {
+        if overlayWindow == nil {
+            let win = NSWindow(contentRect: NSRect(x: frame.minX, y: frame.minY, width: frame.width, height: frame.height),
+                               styleMask: [.borderless],
+                               backing: .buffered,
+                               defer: false)
+            win.level = .statusBar + 1
+            win.backgroundColor = .clear
+            win.isOpaque = false
+            win.hasShadow = false
+            win.ignoresMouseEvents = false
+            
+            let btn = NSButton(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
+            btn.isBordered = false
+            btn.title = ""
+            btn.image = NSImage(systemSymbolName: prefs.iconStyle.collapsedIcon, accessibilityDescription: "Unhide")
+            btn.target = self
+            btn.action = #selector(overlayChevronClicked)
+            win.contentView = btn
+            
+            overlayWindow = win
+        }
+        overlayWindow?.setFrame(frame, display: true)
+        overlayWindow?.orderFront(nil)
+    }
+    
+    private func hideOverlayChevron() {
+        overlayWindow?.orderOut(nil)
+        overlayWindow = nil
+    }
+    
+    @objc private func overlayChevronClicked() {
+        toggle()
     }
     
     /// Production-grade coordinate calculation:
@@ -329,12 +378,6 @@ class MenuBarController: NSObject {
                     self.logToFile("❌ Activation error: \(error)")
                 } else {
                     self.logToFile("✅ HideBar assertion active: Selected items hidden!")
-                    
-                    // Hack to force the chevron to redraw if macOS Assessment Mode incorrectly hid it
-                    // because of the missing Team ID in ad-hoc signatures.
-                    self.expandItem.isVisible = false
-                    try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
-                    self.expandItem.isVisible = true
                 }
             }
         }

@@ -114,8 +114,10 @@ class ShelfWindowController: NSWindowController {
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.15
             panel.animator().alphaValue = 0.0
-        }, completionHandler: {
-            self.panel.orderOut(nil)
+        }, completionHandler: { [weak self] in
+            Task { @MainActor in
+                self?.panel?.orderOut(nil)
+            }
         })
     }
 }

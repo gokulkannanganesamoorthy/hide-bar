@@ -86,7 +86,39 @@ class MenuBarController: NSObject {
     
     private func checkAccessibilityPermissions() {
         if !AXIsProcessTrusted() {
-            print("⚠️ HideBar needs Accessibility permission to calculate icon coordinates.")
+            logToFile("⚠️ HideBar needs Accessibility permission to calculate icon coordinates.")
+            let alert = NSAlert()
+            alert.messageText = "Accessibility Permission Required"
+            alert.informativeText = "HideBar needs Accessibility access to find menu bar icons. Please grant it in System Settings > Privacy & Security > Accessibility, then restart HideBar."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Open Settings")
+            alert.addButton(withTitle: "Quit")
+            
+            NSApp.activate(ignoringOtherApps: true)
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                NSApplication.shared.terminate(nil)
+            } else {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+    }
+    
+    private func logToFile(_ message: String) {
+        print(message)
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".hidebar_log.txt")
+        let text = "\(Date()): \(message)\n"
+        if let data = text.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: url.path) {
+                if let fileHandle = try? FileHandle(forWritingTo: url) {
+                    fileHandle.seekToEndOfFile()
+                    fileHandle.write(data)
+                    fileHandle.closeFile()
+                }
+            } else {
+                try? data.write(to: url)
+            }
         }
     }
     
@@ -172,11 +204,14 @@ class MenuBarController: NSObject {
     /// 2. Every item located to the RIGHT of the separator (|)
     /// 3. All non-running apps or items that must stay visible
     private func applyHideBasedOnCoordinates() async {
+        logToFile("=== Starting applyHideBasedOnCoordinates ===")
         // If Accessibility is not yet granted, prompt user once
         if !AXIsProcessTrusted() {
             let promptKey = "AXTrustedCheckOptionPrompt" as CFString
             let options = [promptKey: true] as CFDictionary
             AXIsProcessTrustedWithOptions(options)
+            logToFile("❌ Failed: AXIsProcessTrusted is false.")
+            return
         }
         
         // Take an AX snapshot of the physical menu bar items
@@ -196,7 +231,7 @@ class MenuBarController: NSObject {
         }
         
         let splitThreshold = separatorX ?? 0
-        print("📍 HideBar split coordinate threshold: X = \(splitThreshold)")
+        logToFile("📍 HideBar split coordinate threshold: X = \(splitThreshold)")
         
         var bundlesToHide = Set<String>()
         var bundlesToKeep = Set<String>()
@@ -212,10 +247,10 @@ class MenuBarController: NSObject {
             // Note: Menu bar items go from left to right; items with smaller minX are to the left.
             if item.frame.maxX <= splitThreshold {
                 bundlesToHide.insert(bundleID)
-                print("🙈 Marking for hide: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
+                logToFile("🙈 Marking for hide: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
             } else {
                 bundlesToKeep.insert(bundleID)
-                print("👁️ Keeping visible: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
+                logToFile("👁️ Keeping visible: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
             }
         }
         
@@ -237,15 +272,19 @@ class MenuBarController: NSObject {
             }
         }
         
-        print("🎯 Active Allowed Bundles count: \(bundlesToKeep.count)")
-        print("🎯 Active Hidden Bundles count: \(bundlesToHide.count)")
+        logToFile("🎯 Active Allowed Bundles count: \(bundlesToKeep.count)")
+        logToFile("🎯 Active Hidden Bundles count: \(bundlesToHide.count)")
+        logToFile("Allowed bundles: \(bundlesToKeep)")
+        logToFile("Hidden bundles: \(bundlesToHide)")
         
         // Activate macOS 27 Assessment assertion
         let assertion = AssessmentMode.activate(bundleIDs: Array(bundlesToKeep)) { error in
-            if let error = error {
-                print("❌ Activation error: \(error)")
-            } else {
-                print("✅ HideBar assertion active: Selected items hidden!")
+            Task { @MainActor in
+                if let error = error {
+                    self.logToFile("❌ Activation error: \(error)")
+                } else {
+                    self.logToFile("✅ HideBar assertion active: Selected items hidden!")
+                }
             }
         }
         
@@ -287,8 +326,8 @@ class MenuBarController: NSObject {
         }
         
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 440),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 650, height: 450),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )

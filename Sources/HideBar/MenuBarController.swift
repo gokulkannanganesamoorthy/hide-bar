@@ -235,6 +235,7 @@ class MenuBarController: NSObject {
         
         var bundlesToHide = Set<String>()
         var bundlesToKeep = Set<String>()
+        var allowedSystemItems = Set(SystemItem.allCases)
         
         // Always whitelist our own bundle so HideBar Ultra's chevron and separator stay visible
         let myBundle = Bundle.main.bundleIdentifier ?? "com.gokul.HideBar"
@@ -243,8 +244,24 @@ class MenuBarController: NSObject {
         for item in items {
             guard let bundleID = item.id.bundleID, bundleID != myBundle else { continue }
             
+            // Check if it's a core system item (Battery, Wi-Fi, Control Center, etc.)
+            if let sysItem = MenuBarPolicy.systemItem(for: item.id) {
+                if item.frame.maxX <= splitThreshold {
+                    allowedSystemItems.remove(sysItem)
+                    logToFile("🙈 Marking System Item for hide: \(sysItem) at x=\(item.frame.minX)...\(item.frame.maxX)")
+                } else {
+                    logToFile("👁️ Keeping System Item visible: \(sysItem) at x=\(item.frame.minX)...\(item.frame.maxX)")
+                }
+                continue // System items are managed by allowedSystemItems, not bundle IDs
+            }
+            
+            // Do not manage system hosts via bundle ID
+            if MenuBarPolicy.isUnmanagedAppleBundle(bundleID) {
+                logToFile("ℹ️ Skipping unmanaged apple bundle: \(bundleID)")
+                continue
+            }
+            
             // If the item is located to the LEFT of our separator/chevron, it gets hidden!
-            // Note: Menu bar items go from left to right; items with smaller minX are to the left.
             if item.frame.maxX <= splitThreshold {
                 bundlesToHide.insert(bundleID)
                 logToFile("🙈 Marking for hide: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
@@ -255,9 +272,11 @@ class MenuBarController: NSObject {
         }
         
         // If no third-party icons were to the left, fallback to hiding third-party items to the left of the chevron
-        if bundlesToHide.isEmpty {
+        if bundlesToHide.isEmpty && allowedSystemItems.count == SystemItem.allCases.count {
             for item in items {
                 guard let bundleID = item.id.bundleID, bundleID != myBundle else { continue }
+                if MenuBarPolicy.isUnmanagedAppleBundle(bundleID) { continue }
+                
                 if item.frame.minX < splitThreshold {
                     bundlesToHide.insert(bundleID)
                 }
@@ -272,13 +291,21 @@ class MenuBarController: NSObject {
             }
         }
         
+        // Ensure system agent bundles are always kept to prevent breaking system items
+        let systemHosts = [
+            "com.apple.MenuBarAgent",
+            "com.apple.TextInputMenuAgent",
+            "com.apple.controlcenter",
+            "com.apple.screencaptureui"
+        ]
+        systemHosts.forEach { bundlesToKeep.insert($0) }
+        
         logToFile("🎯 Active Allowed Bundles count: \(bundlesToKeep.count)")
         logToFile("🎯 Active Hidden Bundles count: \(bundlesToHide.count)")
-        logToFile("Allowed bundles: \(bundlesToKeep)")
-        logToFile("Hidden bundles: \(bundlesToHide)")
+        logToFile("🎯 Active Allowed System Items: \(allowedSystemItems)")
         
         // Activate macOS 27 Assessment assertion
-        let assertion = AssessmentMode.activate(bundleIDs: Array(bundlesToKeep)) { error in
+        let assertion = AssessmentMode.activate(allowing: Array(allowedSystemItems), bundleIDs: Array(bundlesToKeep)) { error in
             Task { @MainActor in
                 if let error = error {
                     self.logToFile("❌ Activation error: \(error)")

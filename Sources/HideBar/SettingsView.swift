@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
 struct SettingsView: View {
     @ObservedObject var prefs = PreferencesManager.shared
@@ -60,6 +61,32 @@ struct GeneralTab: View {
     
     var body: some View {
         Form {
+            Section {
+                Toggle("Launch HideBar at Login", isOn: Binding(
+                    get: {
+                        if #available(macOS 13.0, *) {
+                            return SMAppService.mainApp.status == .enabled
+                        }
+                        return false
+                    },
+                    set: { enabled in
+                        if #available(macOS 13.0, *) {
+                            do {
+                                if enabled {
+                                    try SMAppService.mainApp.register()
+                                } else {
+                                    try SMAppService.mainApp.unregister()
+                                }
+                            } catch {
+                                print("Failed to update launch at login: \(error)")
+                            }
+                        }
+                    }
+                ))
+            } header: {
+                Text("Startup")
+            }
+            
             Section {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {

@@ -17,11 +17,14 @@ class MenuBarController: NSObject {
     private var settingsWindow: NSWindow?
     private var globalMonitor: Any?
     
+    // The private API assertion object
+    private var activeAssertion: AssessmentAssertion?
+    
     // Asynchronous item enumerator that reads MenuBarAgent via Accessibility
     private let enumerator = ItemEnumerator()
     
-    // Floating cover windows for bruteforce hiding
-    private var coverWindows: [NSWindow] = []
+    // Floating overlay for when Assessment Mode hides our NSStatusItem
+    private var overlayWindow: NSWindow?
     
     private let prefs = PreferencesManager.shared
     
@@ -172,10 +175,28 @@ class MenuBarController: NSObject {
         autoCollapseTimer = nil
         
         if isHidden {
-            showCoverWindows()
+            // Capture chevron frame BEFORE hiding using exact window frame
+            var chevronFrame: NSRect?
+            if let window = expandItem.button?.window {
+                chevronFrame = window.frame
+            }
+            
+            Task {
+                await applyHideBasedOnCoordinates()
+                if let frame = chevronFrame {
+                    self.showOverlayChevron(at: frame)
+                }
+            }
             ShelfWindowController.shared.hide()
         } else {
-            hideCoverWindows()
+            hideOverlayChevron()
+            
+            // Restore all items
+            if let assertion = activeAssertion {
+                assertion.invalidate()
+                activeAssertion = nil
+                print("✅ Invalidation complete: all items restored.")
+            }
             
             if prefs.showFloatingShelf {
                 ShelfWindowController.shared.showUnderStatusItem(button: expandItem.button)
@@ -197,61 +218,50 @@ class MenuBarController: NSObject {
         }
     }
     
-    private func showCoverWindows() {
-        hideCoverWindows()
-        
-        guard let buttonWindow = separatorItem.button?.window,
-              let screen = buttonWindow.screen else { return }
-        
-        // Find the absolute right edge of the separator on the screen
-        let maxX = buttonWindow.convertToScreen(separatorItem.button?.frame ?? .zero).maxX
-        
-        Task { @MainActor in
-            let items = await enumerator.snapshotItems()
-            var minX = maxX
-            
-            for item in items {
-                // Ignore our own items and the Apple/App menus by assuming status items are mostly contiguous from the right
-                if item.frame.maxX <= maxX {
-                    if item.frame.minX < minX && item.frame.minX > (screen.frame.width * 0.25) {
-                        minX = item.frame.minX
-                    }
-                }
-            }
-            
-            // Add a small padding
-            minX -= 10
-            if minX >= maxX { return } // Nothing to cover
-            
-            let menuBarHeight = NSStatusBar.system.thickness
-            let frame = NSRect(x: minX, y: screen.visibleFrame.maxY, width: maxX - minX, height: menuBarHeight)
-            
-            let win = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
-            win.level = .statusBar + 1
+    private func showOverlayChevron(at frame: NSRect) {
+        if overlayWindow == nil {
+            let win = NSWindow(contentRect: frame,
+                               styleMask: [.borderless],
+                               backing: .buffered,
+                               defer: false)
+            win.level = .statusBar
             win.backgroundColor = .clear
             win.isOpaque = false
             win.hasShadow = false
-            win.ignoresMouseEvents = false // Block clicks to hidden items
-            win.collectionBehavior = [.transient, .ignoresCycle] // Hide in fullscreen
+            win.ignoresMouseEvents = false
+            // Don't float over fullscreen apps or spaces
+            win.collectionBehavior = [.transient, .ignoresCycle]
             
-            let blur = NSVisualEffectView(frame: win.contentView!.bounds)
-            blur.autoresizingMask = [.width, .height]
-            blur.material = .headerView // Best match for menu bar
-            blur.state = .active
-            blur.blendingMode = .behindWindow
-            win.contentView = blur
+            let btn = NSButton(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
+            btn.isBordered = false
             
-            win.setFrame(frame, display: true)
-            win.orderFront(nil)
-            self.coverWindows.append(win)
+            if let symbolName = prefs.iconStyle.collapsedIcon {
+                let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+                btn.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Unhide")?.withSymbolConfiguration(config)
+                btn.title = ""
+            } else {
+                btn.image = nil
+                btn.title = prefs.customTextCollapsed
+                btn.font = .systemFont(ofSize: 14, weight: .regular)
+            }
+            
+            btn.target = self
+            btn.action = #selector(overlayChevronClicked)
+            win.contentView = btn
+            
+            overlayWindow = win
         }
+        overlayWindow?.setFrame(frame, display: true)
+        overlayWindow?.orderFront(nil)
     }
     
-    private func hideCoverWindows() {
-        for win in coverWindows {
-            win.orderOut(nil)
-        }
-        coverWindows.removeAll()
+    private func hideOverlayChevron() {
+        overlayWindow?.orderOut(nil)
+        overlayWindow = nil
+    }
+    
+    @objc private func overlayChevronClicked() {
+        toggle()
     }
     
     /// Production-grade coordinate calculation:
@@ -259,7 +269,139 @@ class MenuBarController: NSObject {
     /// 1. HideBar's own process (so the chevron never disappears)
     /// 2. Every item located to the RIGHT of the separator (|)
     /// 3. All non-running apps or items that must stay visible
-    // Replaced by showCoverWindows()
+    private func applyHideBasedOnCoordinates() async {
+        logToFile("=== Starting applyHideBasedOnCoordinates ===")
+        // If Accessibility is not yet granted, prompt user once
+        if !AXIsProcessTrusted() {
+            let promptKey = "AXTrustedCheckOptionPrompt" as CFString
+            let options = [promptKey: true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+            logToFile("❌ Failed: AXIsProcessTrusted is false.")
+            return
+        }
+        
+        // Take an AX snapshot of the physical menu bar items
+        let items = await enumerator.snapshotItems()
+        
+        // Find our separator's horizontal X position on screen
+        var separatorX: CGFloat?
+        if let window = separatorItem.button?.window {
+            let screenFrame = window.convertToScreen(separatorItem.button?.frame ?? .zero)
+            separatorX = screenFrame.minX
+        }
+        
+        // Fallback: If separator frame isn't directly measurable via NSWindow, look for our chevron
+        if separatorX == nil, let window = expandItem.button?.window {
+            let screenFrame = window.convertToScreen(expandItem.button?.frame ?? .zero)
+            separatorX = screenFrame.minX
+        }
+        
+        let splitThreshold = separatorX ?? 0
+        logToFile("📍 HideBar split coordinate threshold: X = \(splitThreshold)")
+        
+        var bundlesToHide = Set<String>()
+        var bundlesToKeep = Set<String>()
+        var allowedSystemItems = Set(SystemItem.allCases)
+        
+        // Always whitelist our own bundle so HideBar Ultra's chevron and separator stay visible
+        let myBundle = Bundle.main.bundleIdentifier ?? "com.gokul.HideBar"
+        bundlesToKeep.insert(myBundle)
+        
+        for item in items {
+            guard let bundleID = item.id.bundleID, bundleID != myBundle else { continue }
+            
+            // Check if it's a core system item (Battery, Wi-Fi, Control Center, etc.)
+            if let sysItem = MenuBarPolicy.systemItem(for: item.id) {
+                if item.frame.maxX <= splitThreshold {
+                    allowedSystemItems.remove(sysItem)
+                    logToFile("🙈 Marking System Item for hide: \(sysItem) at x=\(item.frame.minX)...\(item.frame.maxX)")
+                    
+                    // The keyboard viewer needs its underlying bundle explicitly hidden
+                    if sysItem == .keyboard {
+                        bundlesToHide.insert("com.apple.TextInputMenuAgent")
+                        logToFile("🙈 Marking TextInputMenuAgent for hide")
+                    }
+                } else {
+                    logToFile("👁️ Keeping System Item visible: \(sysItem) at x=\(item.frame.minX)...\(item.frame.maxX)")
+                }
+                continue // System items are managed by allowedSystemItems, not bundle IDs
+            }
+            
+            // Do not manage system hosts via bundle ID
+            if MenuBarPolicy.isUnmanagedAppleBundle(bundleID) {
+                logToFile("ℹ️ Skipping unmanaged apple bundle: \(bundleID)")
+                continue
+            }
+            
+            // If the item is located to the LEFT of our separator/chevron, it gets hidden!
+            if item.frame.maxX <= splitThreshold {
+                bundlesToHide.insert(bundleID)
+                logToFile("🙈 Marking for hide: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
+            } else {
+                bundlesToKeep.insert(bundleID)
+                logToFile("👁️ Keeping visible: \(bundleID) at x=\(item.frame.minX)...\(item.frame.maxX)")
+            }
+        }
+        
+        // If no third-party icons were to the left, fallback to hiding third-party items to the left of the chevron
+        if bundlesToHide.isEmpty && allowedSystemItems.count == SystemItem.allCases.count {
+            for item in items {
+                guard let bundleID = item.id.bundleID, bundleID != myBundle else { continue }
+                if MenuBarPolicy.isUnmanagedAppleBundle(bundleID) { continue }
+                
+                if item.frame.minX < splitThreshold {
+                    bundlesToHide.insert(bundleID)
+                }
+            }
+        }
+        
+        // Build the complete allowlist using both running apps and scanned items
+        let runningApps = NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+        for appBundle in runningApps {
+            bundlesToKeep.insert(appBundle)
+        }
+        
+        for item in items {
+            if let bundleID = item.id.bundleID {
+                bundlesToKeep.insert(bundleID)
+            }
+        }
+        
+        // Strictly remove anything marked for hide
+        bundlesToKeep.subtract(bundlesToHide)
+        
+        // Ensure system agent bundles are always kept to prevent breaking system items
+        let systemHosts = [
+            "com.apple.MenuBarAgent",
+            "com.apple.controlcenter",
+            "com.apple.screencaptureui"
+        ]
+        systemHosts.forEach { bundlesToKeep.insert($0) }
+        
+        // The TextInputMenuAgent needs its bundle ID kept ONLY if we allow the keyboard system item
+        if allowedSystemItems.contains(.keyboard) {
+            bundlesToKeep.insert("com.apple.TextInputMenuAgent")
+        } else {
+            bundlesToKeep.remove("com.apple.TextInputMenuAgent")
+        }
+        
+        logToFile("🎯 Active Allowed Bundles count: \(bundlesToKeep.count)")
+        logToFile("🎯 Active Hidden Bundles count: \(bundlesToHide.count)")
+        logToFile("🎯 Active Allowed System Items: \(allowedSystemItems)")
+        
+        // Activate macOS 27 Assessment assertion
+        let assertion = AssessmentMode.activate(allowing: Array(allowedSystemItems), bundleIDs: Array(bundlesToKeep)) { error in
+            Task { @MainActor in
+                if let error = error {
+                    self.logToFile("❌ Activation error: \(error)")
+                } else {
+                    self.logToFile("✅ HideBar assertion active: Selected items hidden!")
+                }
+            }
+        }
+        
+        self.activeAssertion = assertion
+    }
     
     private func showContextMenu() {
         let menu = NSMenu()
@@ -312,7 +454,9 @@ class MenuBarController: NSObject {
     }
     
     @objc private func quitApp() {
-        hideCoverWindows()
+        if let assertion = activeAssertion {
+            assertion.invalidate()
+        }
         NSApplication.shared.terminate(nil)
     }
 }

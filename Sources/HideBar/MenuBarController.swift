@@ -294,11 +294,15 @@ class MenuBarController: NSObject {
         // Ensure system agent bundles are always kept to prevent breaking system items
         let systemHosts = [
             "com.apple.MenuBarAgent",
-            "com.apple.TextInputMenuAgent",
             "com.apple.controlcenter",
             "com.apple.screencaptureui"
         ]
         systemHosts.forEach { bundlesToKeep.insert($0) }
+        
+        // The TextInputMenuAgent needs its bundle ID kept ONLY if we allow the keyboard system item
+        if allowedSystemItems.contains(.keyboard) {
+            bundlesToKeep.insert("com.apple.TextInputMenuAgent")
+        }
         
         logToFile("🎯 Active Allowed Bundles count: \(bundlesToKeep.count)")
         logToFile("🎯 Active Hidden Bundles count: \(bundlesToHide.count)")

@@ -5,22 +5,6 @@ import ApplicationServices
 import PelmetCore
 import PelmetEngine
 
-class HoverButton: NSButton {
-    var onHover: (() -> Void)?
-    
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach { removeTrackingArea($0) }
-        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil)
-        addTrackingArea(area)
-    }
-    
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        onHover?()
-    }
-}
-
 @MainActor
 class MenuBarController: NSObject {
     static let shared = MenuBarController()
@@ -38,11 +22,6 @@ class MenuBarController: NSObject {
     
     // Asynchronous item enumerator that reads MenuBarAgent via Accessibility
     private let enumerator = ItemEnumerator()
-    
-    // Caches to prevent rapid-toggle bugs
-    private var cachedBundlesToKeep = Set<String>()
-    private var cachedBundlesToHide = Set<String>()
-    private var cachedAllowedSystemItems = Set<SystemItem>(SystemItem.allCases)
     
     // Floating overlay for when Assessment Mode hides our NSStatusItem
     private var overlayWindow: NSWindow?
@@ -95,7 +74,14 @@ class MenuBarController: NSObject {
         }
         
         // Setup Shelf Window Callbacks
-        ShelfWindowController.shared.setup()
+        ShelfWindowController.shared.setup(
+            onToggle: { [weak self] in
+                self?.toggle()
+            },
+            onOpenSettings: { [weak self] in
+                self?.openSettings()
+            }
+        )
         
         setupObservers()
         checkAccessibilityPermissions()
@@ -201,9 +187,7 @@ class MenuBarController: NSObject {
                     self.showOverlayChevron(at: frame)
                 }
             }
-            if prefs.showFloatingShelf {
-                ShelfWindowController.shared.showHUD(isHidden: true)
-            }
+            ShelfWindowController.shared.hide()
         } else {
             hideOverlayChevron()
             
@@ -215,7 +199,7 @@ class MenuBarController: NSObject {
             }
             
             if prefs.showFloatingShelf {
-                ShelfWindowController.shared.showHUD(isHidden: false)
+                ShelfWindowController.shared.showUnderStatusItem(button: expandItem.button)
             }
             
             if prefs.autoCollapseDelay > 0 {
@@ -233,6 +217,7 @@ class MenuBarController: NSObject {
             updateButtonAppearance(button: btn)
         }
     }
+    
     private func showOverlayChevron(at frame: NSRect) {
         if overlayWindow == nil {
             let win = NSWindow(contentRect: frame,
@@ -247,7 +232,7 @@ class MenuBarController: NSObject {
             // Don't float over fullscreen apps or spaces
             win.collectionBehavior = [.transient, .ignoresCycle]
             
-            let btn = HoverButton(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
+            let btn = NSButton(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
             btn.isBordered = false
             
             if let symbolName = prefs.iconStyle.collapsedIcon {
@@ -262,10 +247,6 @@ class MenuBarController: NSObject {
             
             btn.target = self
             btn.action = #selector(overlayChevronClicked)
-            btn.onHover = { [weak self] in
-                guard let self = self, self.isHidden else { return }
-                self.toggle()
-            }
             win.contentView = btn
             
             overlayWindow = win
@@ -374,12 +355,20 @@ class MenuBarController: NSObject {
             }
         }
         
-        // Build the complete allowlist of all running apps minus the ones we explicitly hide
+        // Build the complete allowlist using both running apps and scanned items
+        let runningApps = NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+        for appBundle in runningApps {
+            bundlesToKeep.insert(appBundle)
+        }
+        
         for item in items {
-            if let bundleID = item.id.bundleID, !bundlesToHide.contains(bundleID) {
+            if let bundleID = item.id.bundleID {
                 bundlesToKeep.insert(bundleID)
             }
         }
+        
+        // Strictly remove anything marked for hide
+        bundlesToKeep.subtract(bundlesToHide)
         
         // Ensure system agent bundles are always kept to prevent breaking system items
         let systemHosts = [
@@ -394,19 +383,6 @@ class MenuBarController: NSObject {
             bundlesToKeep.insert("com.apple.TextInputMenuAgent")
         } else {
             bundlesToKeep.remove("com.apple.TextInputMenuAgent")
-        }
-        
-        // Rapid-toggle bug fix: If snapshot was taken while items were animating or still hidden,
-        // it will find 0 items to hide. In this case, reuse the last known good configuration!
-        if bundlesToHide.isEmpty && !cachedBundlesToHide.isEmpty {
-            logToFile("⚠️ Found 0 items to hide. Assuming rapid-toggle scan failure. Reusing last known good config.")
-            bundlesToKeep = cachedBundlesToKeep
-            bundlesToHide = cachedBundlesToHide
-            allowedSystemItems = cachedAllowedSystemItems
-        } else {
-            cachedBundlesToKeep = bundlesToKeep
-            cachedBundlesToHide = bundlesToHide
-            cachedAllowedSystemItems = allowedSystemItems
         }
         
         logToFile("🎯 Active Allowed Bundles count: \(bundlesToKeep.count)")

@@ -249,6 +249,12 @@ class MenuBarController: NSObject {
                 if item.frame.maxX <= splitThreshold {
                     allowedSystemItems.remove(sysItem)
                     logToFile("🙈 Marking System Item for hide: \(sysItem) at x=\(item.frame.minX)...\(item.frame.maxX)")
+                    
+                    // The keyboard viewer needs its underlying bundle explicitly hidden
+                    if sysItem == .keyboard {
+                        bundlesToHide.insert("com.apple.TextInputMenuAgent")
+                        logToFile("🙈 Marking TextInputMenuAgent for hide")
+                    }
                 } else {
                     logToFile("👁️ Keeping System Item visible: \(sysItem) at x=\(item.frame.minX)...\(item.frame.maxX)")
                 }
@@ -302,6 +308,8 @@ class MenuBarController: NSObject {
         // The TextInputMenuAgent needs its bundle ID kept ONLY if we allow the keyboard system item
         if allowedSystemItems.contains(.keyboard) {
             bundlesToKeep.insert("com.apple.TextInputMenuAgent")
+        } else {
+            bundlesToKeep.remove("com.apple.TextInputMenuAgent")
         }
         
         logToFile("🎯 Active Allowed Bundles count: \(bundlesToKeep.count)")
@@ -315,6 +323,12 @@ class MenuBarController: NSObject {
                     self.logToFile("❌ Activation error: \(error)")
                 } else {
                     self.logToFile("✅ HideBar assertion active: Selected items hidden!")
+                    
+                    // Hack to force the chevron to redraw if macOS Assessment Mode incorrectly hid it
+                    // because of the missing Team ID in ad-hoc signatures.
+                    self.expandItem.isVisible = false
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
+                    self.expandItem.isVisible = true
                 }
             }
         }
